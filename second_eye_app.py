@@ -3,6 +3,17 @@ import time
 import math
 from datetime import datetime
 import numpy as np
+import os
+
+# Force headless OpenCV — prevents libGL.so.1 errors on Streamlit Cloud
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "0"
+os.environ.setdefault("DISPLAY", "")
+
+try:
+    import cv2
+except ImportError:
+    st.error("OpenCV not found. Check requirements.txt.")
+    st.stop()
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -500,8 +511,6 @@ with col_ctrl:
 # ══════════════════════════════════════════════════════════════════════════════
 # CAMERA PROCESSING  (runs after layout is drawn)
 # ══════════════════════════════════════════════════════════════════════════════
-import cv2
-
 if st.session_state.cam_mode == "upload":
     # ── Upload mode ──────────────────────────────────────────────────────────
     uploaded = st.file_uploader(
