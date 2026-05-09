@@ -3,17 +3,8 @@ import time
 import math
 from datetime import datetime
 import numpy as np
-import os
-
-# Force headless OpenCV — prevents libGL.so.1 errors on Streamlit Cloud
-os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "0"
-os.environ.setdefault("DISPLAY", "")
-
-try:
-    import cv2
-except ImportError:
-    st.error("OpenCV not found. Check requirements.txt.")
-    st.stop()
+import io
+from PIL import Image
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -175,22 +166,24 @@ def classify_detection(label: str):
         return "warn"
     return "default"
 
-def run_yolo(model, frame_rgb: np.ndarray):
-    """Run YOLOv8 inference; return (annotated_frame, detections_list)."""
-    import cv2
-    results   = model(frame_rgb, verbose=False, conf=0.35)[0]
-    annotated = results.plot()          # BGR annotated frame
-    annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+def run_yolo(model, pil_image: Image.Image):
+    """Run YOLOv8 inference on a PIL image; return (annotated PIL image, detections list)."""
+    img_array = np.array(pil_image)
+    results   = model(img_array, verbose=False, conf=0.35)[0]
+    # results.plot() returns BGR numpy array — convert via PIL
+    annotated_bgr = results.plot()
+    annotated_rgb = annotated_bgr[:, :, ::-1]   # BGR → RGB
+    annotated_pil = Image.fromarray(annotated_rgb)
 
     detections = []
     for box in results.boxes:
-        cls_id  = int(box.cls[0])
-        label   = model.names[cls_id]
-        conf    = float(box.conf[0])
-        level   = classify_detection(label)
+        cls_id = int(box.cls[0])
+        label  = model.names[cls_id]
+        conf   = float(box.conf[0])
+        level  = classify_detection(label)
         detections.append({"label": label, "conf": conf, "level": level})
 
-    return annotated_rgb, detections
+    return annotated_pil, detections
 
 # ─── Session State ────────────────────────────────────────────────────────────
 defaults = {
@@ -519,13 +512,11 @@ if st.session_state.cam_mode == "upload":
         key="uploader",
     )
     if uploaded:
-        file_bytes = np.frombuffer(uploaded.read(), np.uint8)
-        img_bgr    = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        img_rgb    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        annotated_rgb, dets = run_yolo(model, img_rgb)
+        pil_img = Image.open(uploaded).convert("RGB")
+        annotated_pil, dets = run_yolo(model, pil_img)
         st.session_state.detections = dets
         with cam_placeholder:
-            st.image(annotated_rgb, use_container_width=True, caption="YOLOv8 detections")
+            st.image(annotated_pil, use_container_width=True, caption="YOLOv8 detections")
         if st.session_state.running:
             st.session_state.tick += 1
         st.rerun()
@@ -546,15 +537,12 @@ else:
         )
 
     if frame_data is not None:
-        file_bytes = np.frombuffer(frame_data.getvalue(), np.uint8)
-        img_bgr    = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        img_rgb    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
-        annotated_rgb, dets = run_yolo(model, img_rgb)
+        pil_img = Image.open(io.BytesIO(frame_data.getvalue())).convert("RGB")
+        annotated_pil, dets = run_yolo(model, pil_img)
         st.session_state.detections = dets
 
         with frame_placeholder:
-            st.image(annotated_rgb, use_container_width=True, caption="YOLOv8 live detections")
+            st.image(annotated_pil, use_container_width=True, caption="YOLOv8 live detections")
 
         if st.session_state.running:
             time.sleep(0.5)
