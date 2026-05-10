@@ -150,6 +150,20 @@ div[data-testid="stCameraInput"] { margin:0 !important; }
 div[data-testid="stFileUploader"]>label { color:#6b7280 !important; font-size:11px !important; }
 div[data-testid="stImage"] { margin:0 !important; }
 div[data-testid="stRadio"]>label { color:#6b7280 !important; font-size:11px !important; }
+
+/* camera facing toggle */
+.cam-facing-bar { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+.facing-btn {
+    display:inline-flex; align-items:center; gap:5px;
+    font-family:'JetBrains Mono',monospace; font-size:10px;
+    padding:5px 12px; border-radius:20px; cursor:pointer;
+    border:1px solid #2a2a48; background:#111120; color:#6b7280;
+    transition:all .15s;
+}
+.facing-btn.active {
+    background:#1a2550; border-color:#3b5bdb; color:#a5b4fc;
+}
+.facing-info { font-family:'JetBrains Mono',monospace; font-size:9px; color:#374151; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -157,6 +171,11 @@ div[data-testid="stRadio"]>label { color:#6b7280 !important; font-size:11px !imp
 DEFAULTS = {
     "tick": 0, "alerts": [], "destination": "Blok M Station",
     "detections": [], "cam_mode": "webcam", "last_frame_id": None,
+    "video_frames": [],      # extracted PIL frames from uploaded video
+    "video_frame_idx": 0,    # slider position
+    "video_playing": False,  # auto-play state
+    "video_name": None,      # detect re-upload
+    "cam_facing": "user",    # "user" = front, "environment" = back
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -341,10 +360,11 @@ with col_center:
     st.markdown('<div class="sec-label">Live Camera · AI Detection</div>', unsafe_allow_html=True)
 
     cam_mode = st.radio(
-        "Input", ["📷  Webcam", "🖼  Upload image"],
+        "Input", ["📷  Webcam", "🖼  Upload image", "🎬  Upload video"],
         horizontal=True, label_visibility="collapsed",
     )
     use_webcam = "Webcam" in cam_mode
+    use_video  = "video"  in cam_mode
 
     ts_str = datetime.now().strftime("%H:%M:%S")
     st.markdown(f"""
@@ -375,10 +395,64 @@ with col_center:
   {bar}
 </div>""", unsafe_allow_html=True)
 
-    # ── Camera logic (no auto-rerun loop — only reruns on new frame) ──────
+    # ── Camera logic ──────────────────────────────────────────────────────────
     if use_webcam:
+        # Camera facing selector
+        facing = st.session_state.cam_facing
+        fa_front = "active" if facing == "user" else ""
+        fa_back  = "active" if facing == "environment" else ""
+        fa_label = "Front camera" if facing == "user" else "Back camera"
+
+        st.markdown(f"""
+<div class="cam-facing-bar">
+  <span class="facing-info">Camera:</span>
+  <span class="facing-btn {fa_front}" id="btn-front">📱 Front</span>
+  <span class="facing-btn {fa_back}"  id="btn-back">📷 Back</span>
+  <span class="facing-info" style="margin-left:4px;">Active: {fa_label}</span>
+</div>""", unsafe_allow_html=True)
+
+        # Two real buttons (hidden with CSS trick using columns)
+        _c1, _c2, _c3 = st.columns([1, 1, 4])
+        with _c1:
+            if st.button("📱 Front", key="btn_front_cam",
+                         help="Switch to front-facing camera",
+                         use_container_width=True):
+                st.session_state.cam_facing    = "user"
+                st.session_state.last_frame_id = None
+                st.rerun()
+        with _c2:
+            if st.button("📷 Back", key="btn_back_cam",
+                         help="Switch to rear/back camera",
+                         use_container_width=True):
+                st.session_state.cam_facing    = "environment"
+                st.session_state.last_frame_id = None
+                st.rerun()
+
+        # Inject JS to override getUserMedia with the chosen facingMode
+        facing_mode = st.session_state.cam_facing
+        st.components.v1.html(f"""
+<script>
+(function() {{
+  const facingMode = "{facing_mode}";
+  const _getUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+  navigator.mediaDevices.getUserMedia = function(constraints) {{
+    if (constraints && constraints.video) {{
+      if (typeof constraints.video === "object") {{
+        constraints.video.facingMode = {{ ideal: facingMode }};
+      }} else {{
+        constraints.video = {{ facingMode: {{ ideal: facingMode }} }};
+      }}
+    }}
+    return _getUserMedia(constraints);
+  }};
+}})();
+</script>
+""", height=0)
+
         with frame_slot:
-            captured = st.camera_input("cam", label_visibility="collapsed")
+            # Key changes when facing switches → forces Streamlit to remount widget
+            cam_key = f"cam_{facing_mode}"
+            captured = st.camera_input("cam", label_visibility="collapsed", key=cam_key)
 
         if captured is not None:
             fid = hash(captured.getvalue())
@@ -406,7 +480,117 @@ with col_center:
   📷 Click the shutter button above<br>to capture a frame for AI detection
 </div>""", unsafe_allow_html=True)
 
+    elif use_video:
+        # ── Video upload mode ───────────────────────────────────────────────
+        with frame_slot:
+            vid_file = st.file_uploader(
+                "Video", type=["mp4","mov","avi","mkv","webm"],
+                label_visibility="collapsed",
+            )
+
+        if vid_file is not None:
+            vid_name = vid_file.name + str(vid_file.size)
+
+            # Extract frames only when a new video is uploaded
+            if vid_name != st.session_state.video_name:
+                with annotated_slot:
+                    st.markdown("""<div style="text-align:center;padding:30px;color:#6390f5;
+                    font-family:'JetBrains Mono',monospace;font-size:11px;">
+                    ⏳ Extracting frames…</div>""", unsafe_allow_html=True)
+
+                import av, tempfile, os
+                vid_bytes = vid_file.read()
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                    tmp.write(vid_bytes)
+                    tmp_path = tmp.name
+
+                frames = []
+                try:
+                    container = av.open(tmp_path)
+                    video_stream = container.streams.video[0]
+                    # Sample up to 120 frames evenly
+                    total = video_stream.frames or 9999
+                    sample_every = max(1, total // 120)
+                    for i, frame in enumerate(container.decode(video=0)):
+                        if i % sample_every == 0:
+                            frames.append(frame.to_image())
+                        if len(frames) >= 120:
+                            break
+                    container.close()
+                except Exception as e:
+                    st.error(f"Video decode error: {e}")
+                    frames = []
+                finally:
+                    os.unlink(tmp_path)
+
+                st.session_state.video_frames    = frames
+                st.session_state.video_frame_idx = 0
+                st.session_state.video_playing   = False
+                st.session_state.video_name      = vid_name
+
+            frames = st.session_state.video_frames
+            if frames:
+                total_f = len(frames)
+
+                # Controls row
+                vc1, vc2, vc3 = st.columns([1, 3, 1])
+                with vc1:
+                    play_lbl = "⏸ Pause" if st.session_state.video_playing else "▶ Play"
+                    if st.button(play_lbl, key="vid_play"):
+                        st.session_state.video_playing = not st.session_state.video_playing
+                with vc2:
+                    idx = st.slider(
+                        "Frame", 0, total_f - 1,
+                        st.session_state.video_frame_idx,
+                        label_visibility="collapsed",
+                        key="vid_slider",
+                    )
+                    st.session_state.video_frame_idx = idx
+                with vc3:
+                    st.markdown(
+                        f'<div style="text-align:center;font-family:JetBrains Mono,monospace;'
+                        f'font-size:10px;color:#4b5563;padding-top:8px;">{idx+1}/{total_f}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Analyse current frame
+                current_pil = frames[idx]
+                ann_pil, new_dets = run_yolo(model, current_pil)
+                st.session_state.detections = new_dets
+                st.session_state.tick      += 1
+                obs = top_obstacle(new_dets)
+                if obs:
+                    ts    = datetime.now().strftime("%H:%M:%S")
+                    entry = f"[{ts}] {obs['icon']} {obs['name']} (frame {idx+1})"
+                    logs  = st.session_state.alerts
+                    if not logs or logs[-1] != entry:
+                        logs.append(entry)
+                        if len(logs) > 20: logs.pop(0)
+
+                with annotated_slot:
+                    st.image(ann_pil, use_container_width=True)
+
+                # Auto-play: advance frame and rerun
+                if st.session_state.video_playing:
+                    next_idx = (idx + 1) % total_f
+                    st.session_state.video_frame_idx = next_idx
+                    time.sleep(0.12)   # ~8 fps
+                    st.rerun()
+            else:
+                with annotated_slot:
+                    st.markdown("""<div style="text-align:center;padding:40px;color:#2a2a4a;
+                    font-family:'JetBrains Mono',monospace;font-size:11px;">
+                    Could not extract frames from video.</div>""", unsafe_allow_html=True)
+        else:
+            st.session_state.video_name = None
+            with annotated_slot:
+                st.markdown("""
+<div style="text-align:center;padding:60px 20px;color:#2a2a4a;font-family:'JetBrains Mono',monospace;font-size:12px;">
+  🎬 Upload a video file (mp4, mov, avi…)<br>then scrub frames or press Play for auto-detection
+</div>""", unsafe_allow_html=True)
+
     else:
+        # ── Image upload mode ───────────────────────────────────────────────
         with frame_slot:
             uploaded = st.file_uploader(
                 "Image", type=["jpg","jpeg","png","bmp","webp"],
